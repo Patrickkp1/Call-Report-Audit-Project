@@ -1,16 +1,6 @@
 # 01_load_data.py
-# Pulls Call Report data from the FDIC public API (one parquet per quarter)
-# plus the failed-bank list. Outputs go to data/raw/ and data/outcomes/.
-#
-# Two-pass design:
-#   1. load_modern_era():  2008Q1 - 2025Q4 (the original sample window)
-#   2. load_historical():  1995Q3 - 2007Q4 (backfill for a balanced pre-DF baseline)
-#
-# Why two functions? The historical backfill is experimental — some Call Report
-# fields (e.g. ESTINS, past-due 30-89) don't exist pre-2001, and several
-# ratio definitions changed at the Basel I -> Basel III transition. Keeping
-# the historical pull separate makes it easy to skip if it causes issues
-# downstream.
+# Pull Call Report data + failed bank list from the FDIC.
+# Saves one parquet file per quarter to data/raw/.
 
 import os
 import io
@@ -18,18 +8,30 @@ import time
 import requests
 import pandas as pd
 
-# Folders
+# Where to save stuff
 RAW = "data/raw"
 OUT = "data/outcomes"
 os.makedirs(RAW, exist_ok=True)
 os.makedirs(OUT, exist_ok=True)
 
-# Endpoints
+# FDIC API
 URL      = "https://api.fdic.gov/banks/financials"
 FAIL_URL = "https://www.fdic.gov/bank-failures/download-data.csv"
 
+# Quarters to pull: 1995Q3 through 2025Q4
+# (61 quarters pre-Dodd-Frank + 61 quarters post-DF = balanced 122-quarter panel)
+q_ends = ["0331", "0630", "0930", "1231"]
+quarters = []
+for y in range(1995, 2026):
+    for q in q_ends:
+        # Skip the 2 quarters before 1995Q3
+        if y == 1995 and q in ("0331", "0630"):
+            continue
+        quarters.append(f"{y}{q}")
 
-# FDIC MDRM fields I want from the Call Report (IDs + main schedules)
+# Call Report fields I want (MDRM codes from FFIEC)
+# Schedule RC = balance sheet, RC-R = capital, RC-N = past due,
+# RI = income, RC-C = loans by type, RC-L = off-balance sheet
 fields = [
     # IDs
     "CERT", "REPDTE", "NAMEFULL", "STALP", "BKCLASS", "ASSET",
@@ -49,29 +51,12 @@ fields = [
 ]
 
 
-def build_quarter_list(start_year, start_q, end_year, end_q):
-    """Build a list of YYYYMMDD quarter-end strings between two (year, quarter) points.
-
-    start_q / end_q are quarter numbers 1-4 (inclusive on both ends).
-    """
-    q_to_end = {1: "0331", 2: "0630", 3: "0930", 4: "1231"}
-    quarters = []
-    for y in range(start_year, end_year + 1):
-        # Which quarters to include this year
-        q_lo = start_q if y == start_year else 1
-        q_hi = end_q   if y == end_year   else 4
-        for q in range(q_lo, q_hi + 1):
-            quarters.append(f"{y}{q_to_end[q]}")
-    return quarters
-
-
-# Pull every bank for one quarter. The API returns at most 10,000 rows per
-# call, so we page through with a fixed-size for loop. There are ~5k-14k
-# banks per quarter historically (consolidation has shrunk the count over time),
-# so 3 pages is more than enough.
 def get_quarter(repdte):
+    # Pull all banks for one quarter. API caps at 10K rows per call, so we
+    # page through with offsets 0, 10000, 20000 (~5k-14k banks per quarter
+    # historically; consolidation has shrunk the count over time).
     rows = []
-    for offset in range(0, 30000, 10000):   # offsets 0, 10000, 20000
+    for offset in range(0, 30000, 10000):
         params = {
             "filters": f"REPDTE:{repdte}",
             "fields":  ",".join(fields),
@@ -81,74 +66,42 @@ def get_quarter(repdte):
         }
         r = requests.get(URL, params=params, timeout=120)
         page = r.json().get("data", [])
-        # FDIC wraps each row in {"data": {...}} - unwrap it
         for row in page:
             rows.append(row.get("data", row))
         # Last page if we got back fewer than 10K rows
         if len(page) < 10000:
             break
         time.sleep(0.4)   # be polite to the API
-
     df = pd.DataFrame(rows)
     if not df.empty:
         df["REPDTE"] = repdte
     return df
 
 
-# Generic "pull a list of quarters and save each one as parquet" runner.
-# Skips quarters that are already cached on disk.
-def pull_quarters(quarters, label):
-    print(f"\n=== {label}: {len(quarters)} quarters ===")
-    for i, q in enumerate(quarters, 1):
-        path = f"{RAW}/call_report_{q}.parquet"
-        if os.path.exists(path):
-            print(f"[{i}/{len(quarters)}] {q}: cached")
-            continue
-
-        print(f"[{i}/{len(quarters)}] {q}: downloading...")
-        df = get_quarter(q)
-        if df.empty:
-            print(f"   (no data returned)")
-            continue
+# Download each quarter (skip if already saved)
+for i, q in enumerate(quarters, 1):
+    path = f"{RAW}/call_report_{q}.parquet"
+    if os.path.exists(path):
+        print(f"[{i}/{len(quarters)}] {q}: cached")
+        continue
+    print(f"[{i}/{len(quarters)}] {q}: downloading...")
+    df = get_quarter(q)
+    if not df.empty:
         df.to_parquet(path, index=False)
         print(f"   {len(df):,} rows")
 
 
-# Pass 1 - modern era (the original window)
-def load_modern_era():
-    quarters = build_quarter_list(2008, 1, 2025, 4)
-    pull_quarters(quarters, "Modern era (2008Q1 - 2025Q4)")
-
-
-# Pass 2 - historical backfill (matched in length to the post-DF window)
-# Post-DF window is 2010Q4 - 2025Q4 = 61 quarters.
-# So pre-DF window should be 61 quarters ending 2010Q3 -> starts 1995Q3.
-def load_historical():
-    quarters = build_quarter_list(1995, 3, 2007, 4)
-    pull_quarters(quarters, "Historical backfill (1995Q3 - 2007Q4)")
-
-
-# Failed-bank list - small CSV, latin-1 encoding because of accented names.
-# This is the source of truth for our distress labels.
-def load_failed_banks():
-    print("\n=== Failed-bank list ===")
-    r = requests.get(FAIL_URL, timeout=60)
-    fails = pd.read_csv(io.StringIO(r.content.decode("latin-1")))
-    fails.columns = [c.strip() for c in fails.columns]
-    fails = fails.rename(columns={
-        "Bank Name":    "bank_name",
-        "Cert":         "cert",
-        "Closing Date": "closing_date",
-    })
-    fails["closing_date"] = pd.to_datetime(fails["closing_date"], format="mixed")
-    fails["cert"] = pd.to_numeric(fails["cert"], errors="coerce").astype("Int64")
-    fails.to_csv(f"{OUT}/failed_banks.csv", index=False)
-    print(f"   {len(fails):,} failed banks saved")
-
-
-# Run everything top-to-bottom
-load_modern_era()
-load_historical()
-load_failed_banks()
-
-print("\nDone. Raw parquets are in data/raw/, failed-bank list in data/outcomes/.")
+# Download the failed bank list (latin-1 encoding because of accented characters)
+print("\nDownloading failed bank list...")
+r = requests.get(FAIL_URL, timeout=60)
+fails = pd.read_csv(io.StringIO(r.content.decode("latin-1")))
+fails.columns = [c.strip() for c in fails.columns]
+fails = fails.rename(columns={
+    "Bank Name":    "bank_name",
+    "Cert":         "cert",
+    "Closing Date": "closing_date",
+})
+fails["closing_date"] = pd.to_datetime(fails["closing_date"], format="mixed")
+fails["cert"] = pd.to_numeric(fails["cert"], errors="coerce").astype("Int64")
+fails.to_csv(f"{OUT}/failed_banks.csv", index=False)
+print(f"   {len(fails):,} failed banks saved")
