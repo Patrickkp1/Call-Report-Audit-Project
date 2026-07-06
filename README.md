@@ -1,4 +1,4 @@
-# FDIC Bank Failure Prediction — Dodd-Frank Value Test (v3)
+# FDIC Bank Failure Prediction — Dodd-Frank Value Test
 
 A reproducible research pipeline that uses FDIC Call Report data (1995Q3–2025Q4) to test whether the post-2010 Dodd-Frank expansion of regulatory reporting actually improved our ability to predict bank failures from public data.
 
@@ -180,11 +180,6 @@ Ensemble caught 1,866 of 2,465 actual failures = **75.7% recall** at a 3.94% pan
 | Isolation Forest | 24.8Q | 21Q | 95.1% |
 | Autoencoder | 26.8Q | 24Q | 96.5% |
 
-## Version history
-
-- **v3 (this repo)**: Extended panel to 1995Q3, balanced 61-quarter pre/post-DF windows, switched LASSO to diagnostic role, replaced PyTorch autoencoder with sklearn MLPRegressor, chunked unsupervised scoring for memory safety.
-- **v2**: Restructured from notebook to numbered scripts. Added Dodd-Frank Value Test framing. AUC 0.9944 on 2008–2025 panel (550K obs).
-- **v1**: Original notebook with MCA + K-Modes ensemble. AUC 0.972.
 
 ## License
 
